@@ -1,0 +1,425 @@
+package com.ff.bot
+
+import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.GestureDescription
+import android.app.Activity
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.Path
+import android.graphics.PixelFormat
+import android.graphics.PointF
+import android.graphics.drawable.GradientDrawable
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
+import android.media.ImageReader
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
+import android.net.Uri
+import android.os.Bundle
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
+import android.provider.Settings
+import android.view.Gravity
+import android.view.MotionEvent
+import android.view.View
+import android.view.WindowManager
+import android.view.accessibility.AccessibilityEvent
+import android.widget.Button
+import android.widget.LinearLayout
+import android.widget.SeekBar
+import android.widget.Switch
+import android.widget.TextView
+import android.widget.Toast
+import kotlin.math.abs
+import kotlin.math.hypot
+
+object Engine {
+    var aim = false
+    var trigger = false
+    var fov = 240f
+    var smooth = 3f
+    var gain = 1f
+    var minHits = 12
+    var hue = 0f
+    var satMin = 0.55f
+    var valMin = 0.45f
+    var hueTol = 14f
+
+    private val hsv = FloatArray(3)
+
+    private fun match(c: Int): Boolean {
+        Color.RGBToHSV((c shr 16) and 0xFF, (c shr 8) and 0xFF, c and 0xFF, hsv)
+        if (hsv[1] < satMin || hsv[2] < valMin) return false
+        var d = abs(hsv[0] - hue) % 360f
+        if (d > 180f) d = 360f - d
+        return d <= hueTol
+    }
+
+    fun detect(bmp: Bitmap, side: Int, ox: Int, oy: Int): PointF? {
+        val px = IntArray(side * side)
+        Bitmap.createBitmap(bmp, ox, oy, side, side).getPixels(px, 0, side, 0, 0, side, side)
+        val cells = HashMap<Int, Int>()
+        var y = 0
+        while (y < side) {
+            var x = 0
+            while (x < side) {
+                if (match(px[y * side + x])) {
+                    val k = (y / 16) * 1000 + (x / 16)
+                    cells[k] = (cells[k] ?: 0) + 1
+                }
+                x += 2
+            }
+            y += 2
+        }
+        val best = cells.maxByOrNull { it.value } ?: return null
+        if (best.value < minHits) return null
+
+        var sx = 0f
+        var sy = 0f
+        var n = 0
+        val x0 = (best.key % 1000) * 16
+        val y0 = (best.key / 1000) * 16
+        var j = y0
+        while (j < y0 + 16) {
+            var i = x0
+            while (i < x0 + 16) {
+                if (i < side && j < side && match(px[j * side + i])) {
+                    sx += i; sy += j; n++
+                }
+                i += 2
+            }
+            j += 2
+        }
+        if (n == 0) return null
+        val h = side / 2f
+        return PointF((sx / n - h) / h, (sy / n - h) / h)
+    }
+}
+
+class FovView(c: android.content.Context) : View(c) {
+    private val p = Paint().apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 3f
+        color = Color.argb(200, 125, 211, 252)
+        isAntiAlias = true
+    }
+    override fun onDraw(canvas: Canvas) {
+        canvas.drawCircle(width / 2f, height / 2f, Engine.fov, p)
+        invalidate()
+    }
+}
+
+class TouchService : AccessibilityService() {
+    companion object {
+        @Volatile var instance: TouchService? = null
+        private val main = Handler(Looper.getMainLooper())
+    }
+
+    override fun onServiceConnected() { instance = this }
+    override fun onUnbind(i: Intent?): Boolean { instance = null; return super.onUnbind(i) }
+    override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
+    override fun onInterrupt() {}
+
+    fun drag(dx: Float, dy: Float) {
+        val dm = resources.displayMetrics
+        val cx = dm.widthPixels / 2f
+        val cy = dm.heightPixels / 2f
+        val ex = (cx + dx).coerceIn(1f, dm.widthPixels - 2f)
+        val ey = (cy + dy).coerceIn(1f, dm.heightPixels - 2f)
+        val p = Path().apply { moveTo(cx, cy); lineTo(ex, ey) }
+        val g = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(p, 0, 22)).build()
+        main.post { dispatchGesture(g, null, null) }
+    }
+
+    fun tap(x: Float, y: Float) {
+        val p = Path().apply { moveTo(x, y) }
+        val g = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(p, 0, 30)).build()
+        main.post { dispatchGesture(g, null, null) }
+    }
+}
+
+class OverlayService : Service() {
+
+    private lateinit var wm: WindowManager
+    private var fab: View? = null
+    private var panel: View? = null
+    private var fovView: FovView? = null
+    private var reader: ImageReader? = null
+    private var vd: VirtualDisplay? = null
+    private var proj: MediaProjection? = null
+    @Volatile private var alive = true
+    @Volatile private var shot: Bitmap? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        wm = getSystemService(WINDOW_SERVICE) as WindowManager
+        (getSystemService(NOTIFICATION_SERVICE) as NotificationManager)
+            .createNotificationChannel(
+                NotificationChannel("ff", "ffbot", NotificationManager.IMPORTANCE_LOW))
+    }
+
+    override fun onStartCommand(i: Intent?, f: Int, s: Int): Int {
+        startForeground(1, notif(), ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+        if (fab == null) addFab()
+        if (reader == null) startCapture(i)
+        return START_STICKY
+    }
+
+    private fun addFab() {
+        val v = TextView(this).apply {
+            text = "FF"
+            setTextColor(Color.WHITE)
+            textSize = 14f
+            gravity = Gravity.CENTER
+            background = round(0xFF1E1E22.toInt(), 60f)
+            setOnClickListener { openPanel() }
+        }
+        val p = base(60, 60).apply { x = 40; y = 320 }
+        v.setOnTouchListener(Drag(p, v))
+        wm.addView(v, p)
+        fab = v
+    }
+
+    private fun openPanel() {
+        panel?.let { wm.removeView(it); panel = null; return }
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(28, 24, 28, 24)
+            background = round(0xF01A1A1E.toInt(), 28f)
+        }
+        box.addView(sw("Aimbot", Engine.aim) {
+            Engine.aim = it
+            if (it) showFov() else hideFov()
+        })
+        box.addView(sw("Trigger", Engine.trigger) { Engine.trigger = it })
+        box.addView(sl("FOV", 80f, 480f, Engine.fov) { Engine.fov = it })
+        box.addView(sl("Suavizado", 1f, 8f, Engine.smooth) { Engine.smooth = it })
+        box.addView(sl("Ganancia", 0.2f, 3f, Engine.gain) { Engine.gain = it })
+        box.addView(btn("Aprender color") { pick() })
+        box.addView(btn("Cerrar") { openPanel() })
+        val p = base(WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.WRAP_CONTENT).apply { x = 40; y = 400 }
+        wm.addView(box, p)
+        panel = box
+    }
+
+    private fun showFov() {
+        if (fovView != null) return
+        val v = FovView(this)
+        val p = base(WindowManager.LayoutParams.MATCH_PARENT,
+                     WindowManager.LayoutParams.MATCH_PARENT).apply {
+            flags = flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        }
+        wm.addView(v, p)
+        fovView = v
+    }
+
+    private fun hideFov() {
+        fovView?.let { wm.removeView(it) }
+        fovView = null
+    }
+
+    private fun pick() {
+        val v = object : View(this) {
+            override fun onTouchEvent(e: MotionEvent): Boolean {
+                if (e.action == MotionEvent.ACTION_UP) {
+                    val b = shot
+                    if (b != null) {
+                        val px = (e.rawX / 2).toInt().coerceIn(0, b.width - 1)
+                        val py = (e.rawY / 2).toInt().coerceIn(0, b.height - 1)
+                        val c = b.getPixel(px, py)
+                        val h = FloatArray(3)
+                        Color.RGBToHSV(Color.red(c), Color.green(c), Color.blue(c), h)
+                        Engine.hue = h[0]
+                        Engine.satMin = (h[1] * 0.8f).coerceAtLeast(0.35f)
+                        Engine.valMin = (h[2] * 0.7f).coerceAtLeast(0.35f)
+                        toast("Color fijado")
+                    }
+                    wm.removeView(this)
+                }
+                return true
+            }
+        }
+        val p = base(WindowManager.LayoutParams.MATCH_PARENT,
+                     WindowManager.LayoutParams.MATCH_PARENT)
+        wm.addView(v, p)
+    }
+
+    private fun startCapture(i: Intent?) {
+        val data = i?.getParcelableExtra<Intent>("data") ?: return
+        val code = i.getIntExtra("code", -1)
+        val dm = resources.displayMetrics
+        val w = dm.widthPixels / 2
+        val h = dm.heightPixels / 2
+
+        proj = (getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager)
+            .getMediaProjection(code, data)
+        proj!!.registerCallback(object : MediaProjection.Callback() {
+            override fun onStop() { stopSelf() }
+        }, Handler(Looper.getMainLooper()))
+
+        reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
+        vd = proj!!.createVirtualDisplay("ffbot", w, h, dm.densityDpi,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, reader!!.surface, null, null)
+
+        Thread {
+            while (alive) {
+                val img = reader?.acquireLatestImage()
+                if (img == null) { Thread.sleep(4); continue }
+                try {
+                    val pl = img.planes[0]
+                    val pad = pl.rowStride - pl.pixelStride * img.width
+                    val b = Bitmap.createBitmap(img.width + pad / pl.pixelStride, img.height,
+                                                Bitmap.Config.ARGB_8888)
+                    b.copyPixelsFromBuffer(pl.buffer)
+                    shot = b
+                    if (Engine.aim) tick(b)
+                } finally { img.close() }
+            }
+        }.start()
+    }
+
+    private fun tick(b: Bitmap) {
+        val side = Engine.fov.toInt().coerceAtMost(minOf(b.width, b.height))
+        val off = Engine.detect(b, side, (b.width - side) / 2, (b.height - side) / 2) ?: return
+        val dx = off.x * Engine.fov * Engine.gain / Engine.smooth
+        val dy = off.y * Engine.fov * Engine.gain / Engine.smooth
+        if (abs(dx) > 1.2f || abs(dy) > 1.2f) TouchService.instance?.drag(dx, dy)
+        if (Engine.trigger && hypot(off.x.toDouble(), off.y.toDouble()) < 0.03) {
+            val dm = resources.displayMetrics
+            TouchService.instance?.tap(dm.widthPixels / 2f, dm.heightPixels / 2f)
+        }
+    }
+
+    private fun base(w: Int, h: Int) = WindowManager.LayoutParams(w, h,
+        WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS, PixelFormat.TRANSLUCENT)
+
+    private fun round(c: Int, r: Float) = GradientDrawable().apply {
+        setColor(c)
+        cornerRadius = r
+    }
+
+    private fun sw(t: String, on: Boolean, f: (Boolean) -> Unit) = Switch(this).apply {
+        text = t
+        setTextColor(Color.WHITE)
+        isChecked = on
+        setOnCheckedChangeListener { _, v -> f(v) }
+    }
+
+    private fun sl(t: String, min: Float, max: Float, init: Float, f: (Float) -> Unit) =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(TextView(context).apply { text = t; setTextColor(Color.WHITE) })
+            addView(SeekBar(context).apply {
+                this.max = 100
+                progress = (((init - min) / (max - min)) * 100).toInt()
+                setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                    override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) {
+                        f(min + (max - min) * p / 100f)
+                    }
+                    override fun onStartTrackingTouch(s: SeekBar?) {}
+                    override fun onStopTrackingTouch(s: SeekBar?) {}
+                })
+            })
+        }
+
+    private fun btn(t: String, f: () -> Unit) =
+        Button(this).apply { text = t; setOnClickListener { f() } }
+
+    private fun toast(t: String) = Toast.makeText(this, t, Toast.LENGTH_SHORT).show()
+
+    private fun notif(): Notification = Notification.Builder(this, "ff")
+        .setContentTitle("FFBot activo")
+        .setSmallIcon(android.R.drawable.ic_media_play).build()
+
+    override fun onDestroy() {
+        alive = false
+        fab?.let { wm.removeView(it) }
+        panel?.let { wm.removeView(it) }
+        fovView?.let { wm.removeView(it) }
+        reader?.close()
+        vd?.release()
+        proj?.stop()
+        super.onDestroy()
+    }
+
+    override fun onBind(i: Intent?): IBinder? = null
+}
+
+class Drag(private val p: WindowManager.LayoutParams, private val v: View) :
+    View.OnTouchListener {
+    private var x0 = 0
+    private var y0 = 0
+    private var tx = 0
+    private var ty = 0
+    override fun onTouch(view: View, e: MotionEvent): Boolean {
+        val wm = v.context.getSystemService(WindowManager::class.java)
+        when (e.action) {
+            MotionEvent.ACTION_DOWN -> {
+                x0 = p.x; y0 = p.y; tx = e.rawX.toInt(); ty = e.rawY.toInt()
+            }
+            MotionEvent.ACTION_MOVE -> {
+                p.x = x0 + (e.rawX.toInt() - tx)
+                p.y = y0 + (e.rawY.toInt() - ty)
+                wm.updateViewLayout(v, p)
+            }
+        }
+        return false
+    }
+}
+
+class MainActivity : Activity() {
+
+    override fun onCreate(b: Bundle?) {
+        super.onCreate(b)
+        if (!Settings.canDrawOverlays(this)) {
+            startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                Uri.parse("package:$packageName")))
+        }
+
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setBackgroundColor(Color.parseColor("#101014"))
+        }
+        col.addView(TextView(this).apply {
+            text = "FFBot"
+            setTextColor(Color.WHITE)
+            textSize = 22f
+        })
+        col.addView(Button(this).apply {
+            text = "1. Accesibilidad"
+            setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+        })
+        col.addView(Button(this).apply {
+            text = "2. Arrancar"
+            setOnClickListener {
+                startActivityForResult((getSystemService(MEDIA_PROJECTION_SERVICE)
+                    as MediaProjectionManager).createScreenCaptureIntent(), 1)
+            }
+        })
+        setContentView(col)
+    }
+
+    override fun onActivityResult(req: Int, res: Int, data: Intent?) {
+        super.onActivityResult(req, res, data)
+        if (req == 1 && res == RESULT_OK && data != null) {
+            startForegroundService(Intent(this, OverlayService::class.java)
+                .putExtra("data", data).putExtra("code", res))
+            moveTaskToBack(true)
+        }
+    }
+}
