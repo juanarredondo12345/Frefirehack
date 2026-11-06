@@ -1,0 +1,66 @@
+package com.example.myapp;
+
+import android.app.Service;
+import android.content.Intent;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.Paint;
+import android.os.IBinder;
+import android.view.MotionEvent;
+import android.view.View;
+import android.view.WindowManager;
+
+public class AimService extends Service {
+    private WindowManager windowManager;
+    private View aimView;
+    private Paint paint = new Paint();
+
+    @Override
+    public void onCreate() {
+        super.onCreate();
+        initOverlay();
+    }
+
+    private void initOverlay() {
+        windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
+        aimView = new View(this) {
+            @Override
+            protected void onDraw(Canvas canvas) {
+                super.onDraw(canvas);
+                // Dibujar un círculo rojo en el centro
+                canvas.drawCircle(getWidth()/2, getHeight()/2, 20, paint);
+                
+                // Aquí iría la lógica de lectura de memoria
+                // Por ahora, simulamos que detectamos algo si tocas la pantalla
+            }
+            
+            @Override
+            public boolean onTouchEvent(MotionEvent event) {
+                // Simulación de "Aim" al tocar
+                if(event.getAction() == MotionEvent.ACTION_DOWN) {
+                    // Aquí enviarías el evento de toque a Free Fire
+                    return true;
+                }
+                return false;
+            }
+        };
+        
+        paint.setColor(Color.RED);
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(5);
+
+        WindowManager.LayoutParams params = new WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+            8 // PixelFormat.TRANSLUCENT
+        );
+        windowManager.addView(aimView, params);
+    }
+
+    @Override
+    public IBinder onBind(Intent intent) {
+        return null;
+    }
+}
